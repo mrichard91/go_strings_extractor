@@ -523,10 +523,30 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
                         break
                 if not bad:
                     s = cand
+        # Go stores strings contiguously without null terminators; a wrong
+        # len_hint often pulls in adjacent runtime strings.  Detect and fix
+        # the two most common mis-reads.
+
+        # 1) OS name followed by unrelated text (e.g. "windowsfloat32float").
         if s:
-            m_os = re.match(r"^(windows|linux|darwin)[a-z]+$", s)
-            if m_os:
+            m_os = re.match(r"^(windows|linux|darwin)[a-zA-Z0-9_]+", s)
+            if m_os and len(s) > len(m_os.group(1)):
                 s = m_os.group(1)
+
+        # 2) Over-read domain/endpoint strings (len_hint grabbed a nearby
+        #    constant like a port number instead of the real string length).
+        if s and strlen and len(s) > 60:
+            # Look for a domain:port or IP:port prefix.
+            m_dp = re.match(
+                r"^(?:\[[0-9a-fA-F:.]+\]:\d+|[a-zA-Z0-9._-]+\.[a-z]{2,}:\d+)",
+                s,
+            )
+            if m_dp:
+                s = m_dp.group(0)
+            elif not any(ch in s for ch in (" ", "/", "%", "\n")):
+                # Long alphanumeric blob with no separators — likely garbage.
+                s = ""
+
         if s and strlen and s.startswith("[") and "]" not in s:
             cand = read_cstring(blob, off)
             if cand and cand.startswith(s) and "]" in cand and len(cand) <= 96:
