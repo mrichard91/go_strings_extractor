@@ -24,15 +24,20 @@ def parse_block_x86(block_lines):
             for hm in re.finditer(r"\$0x([0-9a-fA-F]+)", s_asm):
                 immediates.append({"kind": "imm", "hex": "0x" + hm.group(1), "value": int(hm.group(1), 16)})
 
-        m = re.match(r"^([0-9a-fA-F]+)\s+lea[lq]?\s+0x([0-9a-fA-F]+)\(%(?:rip|eip)\)", s_asm)
+        m = re.match(
+            r"^([0-9a-fA-F]+)\s+lea[lq]?\s+([+-]?0x[0-9a-fA-F]+)\(%(?:rip|eip)\),\s+%([a-z0-9]+)(?:\s*;\s*0x([0-9a-fA-F]+))?",
+            s_asm,
+        )
         if m:
             insn = int(m.group(1), 16)
-            disp = int(m.group(2), 16)
-            # x86/x64 lea rip/eip displacement size is 7-ish in our streams.
-            target = insn + 7 + disp
+            reg = m.group(3)
+            if m.group(4):
+                target = int(m.group(4), 16)
+            else:
+                disp = int(m.group(2), 16)
+                # x86/x64 lea rip/eip displacement size is 7-ish in our streams.
+                target = insn + 7 + disp
             strlen = None
-            regm = re.search(r",\s+%([a-z0-9]+)$", s_asm)
-            reg = regm.group(1) if regm else ""
 
             for j in range(idx + 1, min(idx + 8, len(block_lines) - 1)):
                 sj = block_lines[j].strip()
@@ -55,7 +60,7 @@ def parse_block_x86(block_lines):
                         break
                 has_conv = conv_j is not None
                 if reg in ("rax", "eax") and has_conv:
-                    for j in range(idx, conv_j + 1):
+                    for j in range(conv_j, idx - 1, -1):
                         sj = block_lines[j].strip()
                         hm = re.search(r"mov[lq]\s+\$0x([0-9a-fA-F]+),\s+%(?:ebx|rbx)", sj)
                         if hm:
@@ -67,7 +72,7 @@ def parse_block_x86(block_lines):
             if strlen is None:
                 has_fprintf = any(("call" in block_lines[j] and "fmt.Fprintf" in block_lines[j]) for j in range(idx + 1, min(idx + 12, len(block_lines))))
                 if reg in ("rcx", "ecx") and has_fprintf:
-                    for j in range(max(0, idx - 12), idx + 1):
+                    for j in range(idx, max(0, idx - 12) - 1, -1):
                         sj = block_lines[j].strip()
                         hm = re.search(r"mov[lq]\s+\$0x([0-9a-fA-F]+),\s+%(?:edi|rdi)", sj)
                         if hm:
@@ -80,7 +85,7 @@ def parse_block_x86(block_lines):
                 has_dial = any(("call" in block_lines[j] and "net.Dial" in block_lines[j]) for j in range(idx + 1, min(idx + 12, len(block_lines))))
                 if has_dial:
                     if reg in ("rax", "eax"):
-                        for j in range(max(0, idx - 6), min(idx + 8, len(block_lines))):
+                        for j in range(min(idx + 7, len(block_lines) - 1), max(0, idx - 6) - 1, -1):
                             sj = block_lines[j].strip()
                             hm = re.search(r"mov[lq]\s+\$0x([0-9a-fA-F]+),\s+%(?:ebx|rbx)", sj)
                             if hm:

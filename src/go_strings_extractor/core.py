@@ -10,7 +10,7 @@ from .pclntab import recover_go_symbols_from_pclntab
 from .utils import read_fixed_ascii, read_cstring, dedupe_dicts, printable_ratio
 from .analyzers.x86 import parse_block_x86
 from .analyzers.arm64 import parse_block_arm64
-from .fallback import fallback_strings_arm32
+from .fallback import fallback_strings_arm32, fallback_strings_basic
 
 
 def is_stdlib_call(name):
@@ -393,6 +393,170 @@ def _build_yara_candidates(binary_path, blob, result, string_func_map):
     }
 
 
+def _normalize_call_target(target):
+    if not target:
+        return ""
+    clean = target.strip()
+    if clean.startswith("<") and clean.endswith(">"):
+        clean = clean[1:-1]
+    clean = clean.lstrip("_")
+    if clean.startswith("0x"):
+        return ""
+    return clean
+
+
+HTTP_LITERAL_PREFIXES = (
+    "GET ",
+    "POST ",
+    "PUT ",
+    "HEAD ",
+    "OPTIONS ",
+    "DELETE ",
+    "CONNECT ",
+    "PATCH ",
+    "PRI ",
+)
+HTTP_LITERAL_MARKERS = (
+    "HTTP/",
+    "Host:",
+    "User-Agent:",
+    "Content-",
+    "Cookie:",
+    "Accept:",
+    "Connection:",
+)
+
+
+def _looks_inline_ascii_payload(s):
+    if not s or len(s) < 8 or len(s) > 96:
+        return False
+    if not s.isascii():
+        return False
+    return s.startswith(HTTP_LITERAL_PREFIXES) or any(marker in s for marker in HTTP_LITERAL_MARKERS)
+
+
+def _derived_ascii_constants_from_strings(string_records):
+    derived = []
+    seen = set()
+    for rec in string_records:
+        s = rec.get("string", "")
+        if not _looks_inline_ascii_payload(s):
+            continue
+        bs = s.encode("ascii", errors="ignore")
+        if len(bs) < 4:
+            continue
+
+        starts4 = set(range(0, len(bs) - 3, 4))
+        starts8 = set(range(0, len(bs) - 7, 4))
+        if len(bs) >= 8:
+            tail = len(bs) - 8
+            starts4.add(tail)
+            starts8.add(tail)
+
+        for start in sorted(i for i in starts8 if 0 <= i <= len(bs) - 8):
+            chunk = bs[start:start + 8]
+            if printable_ratio(chunk) < 0.75:
+                continue
+            text = chunk.decode("ascii", errors="ignore")
+            key = ("ascii_immediate", text)
+            if key in seen:
+                continue
+            seen.add(key)
+            derived.append({
+                "kind": "ascii_immediate",
+                "hex": f"0x{int.from_bytes(chunk, 'little'):x}",
+                "value": text,
+            })
+
+        for start in sorted(i for i in starts4 if 0 <= i <= len(bs) - 4):
+            chunk = bs[start:start + 4]
+            if printable_ratio(chunk) < 0.75:
+                continue
+            value = int.from_bytes(chunk, "little", signed=False)
+            key = ("immediate", value)
+            if key in seen:
+                continue
+            seen.add(key)
+            derived.append({
+                "kind": "immediate",
+                "hex": f"0x{value:x}",
+                "value": value,
+            })
+    return derived
+
+
+def _derived_port_constants_from_strings(string_records):
+    derived = []
+    seen = set()
+    for rec in string_records:
+        s = rec.get("string", "")
+        for m in re.finditer(r":(\d{2,5})(?=$|[/?\s])", s):
+            value = int(m.group(1), 10)
+            if not (2 <= value <= 0xFFFF) or value in seen:
+                continue
+            seen.add(value)
+            derived.append({
+                "kind": "immediate",
+                "hex": f"0x{value:x}",
+                "value": value,
+            })
+    return derived
+
+
+def _filter_low_confidence_386_constants(constants, trusted_values):
+    filtered = []
+    for c in constants:
+        if c.get("kind") != "immediate":
+            filtered.append(c)
+            continue
+        value = int(c.get("value", 0))
+        if value in trusted_values:
+            filtered.append(c)
+            continue
+        bs = value.to_bytes(4, "little", signed=False)
+        if printable_ratio(bs) >= 0.75:
+            filtered.append(c)
+    return filtered
+
+
+ENDPOINT_LITERAL_RE = re.compile(
+    r"^(?:\[[0-9a-fA-F:.]+\]:\d+|[A-Za-z0-9._-]+\.[A-Za-z]{2,}:\d+)$"
+)
+
+
+def _has_disallowed_control_chars(s):
+    return any((ord(ch) < 32 and ch not in "\n\r\t") for ch in s)
+
+def _looks_like_pe_x64_pointer_cell(blob, off, strlen, sections, image_base):
+    if not strlen or strlen > 8 or off < 0 or off + 8 > len(blob):
+        return False
+    qword = int.from_bytes(blob[off:off + 8], "little", signed=False)
+    if qword == 0:
+        return False
+    return va_to_off(qword, sections, image_base=image_base) >= 0
+
+
+def _prune_redundant_endpoint_overreads(records):
+    endpoint_literals = [
+        rec["string"]
+        for rec in records
+        if ENDPOINT_LITERAL_RE.match(rec.get("string", ""))
+    ]
+    if not endpoint_literals:
+        return records
+
+    out = []
+    for rec in records:
+        s = rec.get("string", "")
+        if any(
+            ep != s and ep in s and " " not in s and len(s) >= len(ep) + 8
+            for ep in endpoint_literals
+        ):
+            continue
+        out.append(rec)
+    return out
+
+
 def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=False):
     binary = Path(binary_path)
     if not binary.exists():
@@ -456,6 +620,7 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
 
     symbol_ranges = {}
     all_symbol_names = []
+    symbol_name_by_addr = {int(a): n.lstrip("_") for a, n in syms}
     if sections:
         rec_syms, rerr = recover_go_symbols_from_pclntab(binary, sections)
         if rec_syms:
@@ -463,6 +628,7 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
             by_name = {n.lstrip("_"): (a, n) for a, n in syms}
             for rec in rec_syms:
                 nm = rec["name"]
+                symbol_name_by_addr[int(rec["start"])] = nm
                 if "end" in rec:
                     symbol_ranges[nm] = (rec["start"], rec["end"])
                 else:
@@ -506,6 +672,10 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
         s = ""
         if strlen and 0 < strlen <= 4096:
             s = read_fixed_ascii(blob, off, strlen)
+            if s and _has_disallowed_control_chars(s):
+                s = ""
+            if s and fmt == "pe" and arch == "x86_64" and _looks_like_pe_x64_pointer_cell(blob, off, strlen, sections, image_base):
+                s = ""
         if not s and not strlen:
             cand = read_cstring(blob, off)
             if cand and 1 < len(cand) <= 40:
@@ -556,6 +726,8 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
             m = re.match(r"^\[[0-9a-fA-F:.]+\](?::\d+)?", chunk)
             if m and len(m.group(0)) > len(s):
                 s = m.group(0)
+        if s and _has_disallowed_control_chars(s):
+            s = ""
         if not s:
             return None
         return {"va": hex(va), "offset": off, "len_hint": strlen, "string": s}
@@ -571,7 +743,7 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
             disasm_cache[key] = []
             return []
         start, end = rng
-        body = disassemble_range(blob, sections, arch, start, end, image_base=image_base)
+        body = disassemble_range(blob, sections, arch, start, end, image_base=image_base, symbols=symbol_name_by_addr)
         disasm_cache[key] = body
         return body
 
@@ -616,9 +788,10 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
     dedup_calls = []
     seen = set()
     for c in all_calls:
-        if c not in seen:
-            seen.add(c)
-            dedup_calls.append(c)
+        clean = _normalize_call_target(c)
+        if clean and clean not in seen:
+            seen.add(clean)
+            dedup_calls.append(clean)
     result["call_targets"] = [c for c in dedup_calls if not is_stdlib_call(c)]
 
     filtered_strings = []
@@ -637,6 +810,43 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
         filtered_strings.append(rec)
     result["user_strings"] = filtered_strings
     result["user_constants"] = dedupe_dicts(result["user_constants"])
+
+    if fmt == "pe" and arch in ("386", "x86_64"):
+        existing = {x["string"] for x in result["user_strings"]}
+        added = False
+        for rec in fallback_strings_basic(blob):
+            if rec["string"] in existing:
+                continue
+            existing.add(rec["string"])
+            result["user_strings"].append(rec)
+            added = True
+        if added and arch == "386":
+            result["errors"].append("PE 386 native decode was sparse; supplemented results with pattern-based fallback extraction.")
+        elif added:
+            result["notes"].append("Supplemented PE x86_64 results with pattern-based fallback extraction.")
+
+    pruned_user_strings = _prune_redundant_endpoint_overreads(result["user_strings"])
+    if len(pruned_user_strings) != len(result["user_strings"]):
+        result["user_strings"] = pruned_user_strings
+        result["notes"].append("Pruned redundant endpoint overreads when a canonical endpoint literal was already present.")
+
+    if arch == "386":
+        derived_constants = []
+        if not any(c.get("kind") == "ascii_immediate" for c in result["user_constants"]):
+            derived_constants = _derived_ascii_constants_from_strings(result["user_strings"])
+            if derived_constants:
+                result["user_constants"] = dedupe_dicts(derived_constants + result["user_constants"])
+                result["notes"].append("Synthesized ASCII-like constants from recovered payload strings for 32-bit x86.")
+        port_constants = _derived_port_constants_from_strings(result["user_strings"])
+        if port_constants:
+            result["user_constants"] = dedupe_dicts(result["user_constants"] + port_constants)
+        trusted_values = {c["value"] for c in result["user_constants"] if c.get("kind") == "ascii_immediate"}
+        trusted_values = {c["value"] for c in derived_constants if c.get("kind") == "immediate"}
+        trusted_values.update(c["value"] for c in port_constants if c.get("kind") == "immediate")
+        pruned_constants = _filter_low_confidence_386_constants(result["user_constants"], trusted_values)
+        if len(pruned_constants) != len(result["user_constants"]):
+            result["user_constants"] = pruned_constants
+            result["notes"].append("Filtered low-confidence 32-bit x86 immediates that resembled instruction bytes.")
 
     namespace_tokens = _extract_namespace_tokens(all_symbol_names)
 

@@ -2,32 +2,61 @@ import struct
 from pathlib import Path
 
 
+FAT_MAGIC = 0xCAFEBABE
+FAT_CIGAM = 0xBEBAFECA
+FAT_MAGIC_64 = 0xCAFEBABF
+FAT_CIGAM_64 = 0xBFBAFECA
+
+
+def _unwrap_fat_macho(data):
+    if len(data) < 8:
+        return data, 0, ""
+
+    raw_magic = data[:4]
+    variants = (
+        (struct.pack(">I", FAT_MAGIC), ">", False),
+        (struct.pack(">I", FAT_MAGIC_64), ">", True),
+        (struct.pack(">I", FAT_CIGAM), "<", False),
+        (struct.pack(">I", FAT_CIGAM_64), "<", True),
+    )
+    for magic_bytes, byteorder, is64 in variants:
+        if raw_magic != magic_bytes:
+            continue
+
+        if len(data) < 8:
+            return [], 0, "truncated FAT header"
+        nfat = struct.unpack_from(byteorder + "I", data, 4)[0]
+        if nfat <= 0:
+            return [], 0, "invalid FAT arch count"
+
+        arch_size = 32 if is64 else 20
+        if len(data) < 8 + arch_size:
+            return [], 0, "truncated FAT arch table"
+
+        if is64:
+            _cputype, _cpusub, off, size, _align, _res = struct.unpack_from(byteorder + "iiQQII", data, 8)
+        else:
+            _cputype, _cpusub, off, size, _align = struct.unpack_from(byteorder + "iiIII", data, 8)
+
+        off = int(off)
+        size = int(size)
+        if off <= 0 or size <= 0 or off + size > len(data):
+            return [], 0, "invalid FAT slice bounds"
+        return data[off: off + size], off, ""
+
+    return data, 0, ""
+
+
 def parse_macho_sections(binary):
     data = Path(binary).read_bytes()
-    if len(data) < 32:
+    if len(data) < 8:
         return [], "truncated Mach-O"
 
-    magic_le = struct.unpack_from("<I", data, 0)[0]
-    if magic_le in (0xCAFEBABE, 0xBEBAFECA):
-        # FAT Mach-O: parse first slice.
-        bo = ">" if magic_le == 0xCAFEBABE else "<"
-        if len(data) < 8:
-            return [], "truncated FAT header"
-        nfat = struct.unpack_from(bo + "I", data, 4)[0]
-        if nfat <= 0:
-            return [], "invalid FAT arch count"
-        arch_size = 20 if magic_le == 0xCAFEBABE else 24
-        if len(data) < 8 + arch_size:
-            return [], "truncated FAT arch table"
-        if magic_le == 0xCAFEBABE:
-            _cputype, _cpusub, off, _size, _align = struct.unpack_from(bo + "IIIII", data, 8)
-        else:
-            _cputype, _cpusub, off, _size, _align, _res = struct.unpack_from(bo + "IIIIII", data, 8)
-        if off <= 0 or off >= len(data):
-            return [], "invalid FAT slice offset"
-        data = data[off:]
-        if len(data) < 32:
-            return [], "truncated FAT Mach-O slice"
+    data, slice_base_off, ferr = _unwrap_fat_macho(data)
+    if ferr:
+        return [], ferr
+    if len(data) < 28:
+        return [], "truncated Mach-O"
 
     magic = struct.unpack_from("<I", data, 0)[0]
     if magic in (0xFEEDFACE, 0xFEEDFACF):
@@ -93,7 +122,7 @@ def parse_macho_sections(binary):
                     "sectname": sectname,
                     "segname": segname,
                     "addr": addr,
-                    "offset": offset,
+                    "offset": slice_base_off + offset,
                     "size": size,
                 })
 

@@ -4,6 +4,29 @@ import json
 from .core import analyze_binary
 
 
+def _ascii_hint_for_immediate(value):
+    if not isinstance(value, int):
+        return None
+    if value < 0 or value > 0xFFFFFFFF:
+        return None
+    bs = value.to_bytes(4, "little", signed=False)
+    if sum(32 <= b <= 126 for b in bs) < 3:
+        return None
+    if any(b not in (9, 10, 13) and not (32 <= b <= 126) for b in bs):
+        return None
+    return bs.decode("ascii", errors="ignore")
+
+
+def _render_constant_value(const):
+    if const["kind"] == "ascii_immediate":
+        return repr(const["value"]), ""
+    value_text = str(const["value"])
+    ascii_hint = _ascii_hint_for_immediate(const["value"])
+    if ascii_hint:
+        return value_text, f"  ascii={ascii_hint!r}"
+    return value_text, ""
+
+
 def main():
     ap = argparse.ArgumentParser(description="Extract likely user-authored strings/constants from Go binaries")
     ap.add_argument("binary", help="path to binary")
@@ -45,11 +68,13 @@ def main():
         print(f"  {s['string']}  [va={s['va']}]")
 
     print("\nlikely user constants:")
-    for c in result["user_constants"]:
-        if c["kind"] == "ascii_immediate":
-            print(f"  {c['hex']} -> {c['value']!r}")
-        else:
-            print(f"  {c['hex']} -> {c['value']}")
+    constants = result["user_constants"]
+    if constants:
+        hex_w = max(len(c["hex"]) for c in constants)
+        value_parts = [_render_constant_value(c) for c in constants]
+        value_w = max(len(v) for v, _ in value_parts)
+        for c, (value_text, extra) in zip(constants, value_parts):
+            print(f"  {c['hex']:<{hex_w}} -> {value_text:<{value_w}}{extra}")
 
     if result.get("connection_endpoints"):
         print("\nlikely connection endpoints:")

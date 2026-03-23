@@ -21,7 +21,13 @@ def _signext(v, bits):
     return v
 
 
-def _decode_x86_64(code, start_va):
+def _fmt_signed_hex(v):
+    if v < 0:
+        return f"-0x{-v:x}"
+    return f"0x{v:x}"
+
+
+def _decode_x86_64(code, start_va, symbols=None):
     out = []
     n = len(code)
     seen = set()
@@ -36,7 +42,11 @@ def _decode_x86_64(code, start_va):
             key = (addr, "call", target)
             if key not in seen:
                 seen.add(key)
-                out.append(f"{addr:x}\tcallq 0x{target:x}")
+                name = symbols.get(target) if symbols else None
+                if name:
+                    out.append(f"{addr:x}\tcallq 0x{target:x} <{name}>")
+                else:
+                    out.append(f"{addr:x}\tcallq 0x{target:x}")
 
         # REX-prefixed patterns.
         if i + 2 < n and 0x40 <= code[i] <= 0x4F:
@@ -54,11 +64,14 @@ def _decode_x86_64(code, start_va):
                 rm = (modrm & 0x7) | (rex_b << 3)
                 if mod == 0 and rm == 5:
                     disp = struct.unpack_from("<i", code, i + 3)[0]
+                    target = addr + 7 + disp
                     reg_name = X64_REGS[reg] if rex_w else X86_REGS[reg]
-                    key = (addr, "lea", disp, reg_name)
+                    key = (addr, "lea", target, reg_name)
                     if key not in seen:
                         seen.add(key)
-                        out.append(f"{addr:x}\tlea{'q' if rex_w else 'l'} 0x{(disp & 0xffffffff):x}(%rip), %{reg_name}")
+                        out.append(
+                            f"{addr:x}\tlea{'q' if rex_w else 'l'} {_fmt_signed_hex(disp)}(%rip), %{reg_name} ; 0x{target:x}"
+                        )
 
             # movabs imm64
             if rex_w and 0xB8 <= op <= 0xBF and i + 9 < n:
@@ -139,7 +152,7 @@ def _decode_x86_64(code, start_va):
     return out
 
 
-def _decode_x86_32(code, start_va):
+def _decode_x86_32(code, start_va, symbols=None):
     out = []
     n = len(code)
     seen = set()
@@ -151,7 +164,11 @@ def _decode_x86_32(code, start_va):
             key = (addr, "call", target)
             if key not in seen:
                 seen.add(key)
-                out.append(f"{addr:x}\tcall 0x{target:x}")
+                name = symbols.get(target) if symbols else None
+                if name:
+                    out.append(f"{addr:x}\tcall 0x{target:x} <{name}>")
+                else:
+                    out.append(f"{addr:x}\tcall 0x{target:x}")
         if i + 5 < n and code[i] == 0x8D:
             modrm = code[i + 1]
             mod = (modrm >> 6) & 0x3
@@ -174,7 +191,7 @@ def _decode_x86_32(code, start_va):
     return out
 
 
-def _decode_arm64(code, start_va):
+def _decode_arm64(code, start_va, symbols=None):
     out = []
     i = 0
     n = len(code)
@@ -186,7 +203,11 @@ def _decode_arm64(code, start_va):
         if (ins & 0xFC000000) == 0x94000000:
             imm26 = _signext(ins & 0x03FFFFFF, 26) << 2
             target = addr + imm26
-            out.append(f"{addr:x}\tbl 0x{target:x}")
+            name = symbols.get(target) if symbols else None
+            if name:
+                out.append(f"{addr:x}\tbl 0x{target:x} <{name}>")
+            else:
+                out.append(f"{addr:x}\tbl 0x{target:x}")
             i += 4
             continue
 
@@ -243,7 +264,7 @@ def _decode_arm64(code, start_va):
     return out
 
 
-def disassemble_range(blob, sections, arch, start, end, image_base=None):
+def disassemble_range(blob, sections, arch, start, end, image_base=None, symbols=None):
     if start is None:
         return []
     if end is not None and end <= start:
@@ -262,9 +283,9 @@ def disassemble_range(blob, sections, arch, start, end, image_base=None):
         return []
     code = blob[start_off:end_off]
     if arch == "x86_64":
-        return _decode_x86_64(code, start)
+        return _decode_x86_64(code, start, symbols=symbols)
     if arch == "386":
-        return _decode_x86_32(code, start)
+        return _decode_x86_32(code, start, symbols=symbols)
     if arch == "arm64":
-        return _decode_arm64(code, start)
+        return _decode_arm64(code, start, symbols=symbols)
     return []
