@@ -12,6 +12,16 @@ class TestCoreExtraction:
         for s in expected:
             assert s in got, f"missing string {s!r}; got={sorted(got)}"
 
+    def assert_contains_substring(self, result, needle):
+        got = [x["string"] for x in result["user_strings"]]
+        assert any(needle in s for s in got), f"missing substring {needle!r}; got={sorted(got)}"
+
+    def assert_contains_constant(self, result, kind, value):
+        got = [(x["kind"], x["value"]) for x in result["user_constants"]]
+        assert any(x["kind"] == kind and x["value"] == value for x in result["user_constants"]), (
+            f"missing constant {(kind, value)!r}; got={got}"
+        )
+
     def test_darwin_amd64_core_strings(self):
         r = analyze_binary(fixture_path("network_darwin_amd64.out"))
         assert r["format"] == "macho"
@@ -62,8 +72,42 @@ class TestCoreExtraction:
         r = analyze_binary(fixture_path("network_windows_386.out"))
         assert r["format"] == "pe"
         assert r["arch"] == "386"
-        # x86 PE strict mode currently has limited native decode coverage.
-        assert len(r["analyzed_symbols"]) >= 1
+        assert any("fallback extraction" in e for e in r["errors"])
+        self.assert_contains_strings(
+            r,
+            {
+                "windows",
+                "tcp6",
+                "Got OS info %s\n",
+                "connected to: %s\n",
+                "[2606:4700:3035::ac43:cf7b]:443",
+            },
+        )
+        self.assert_contains_substring(r, "doesthispersonexist.com")
+        self.assert_contains_constant(r, "ascii_immediate", "GET /foo")
+        self.assert_contains_constant(r, "ascii_immediate", "TP/1.1\n\n")
+        self.assert_contains_constant(r, "immediate", 0x20544547)
+        self.assert_contains_constant(r, "immediate", 0x312F5054)
+        self.assert_contains_constant(r, "immediate", 443)
+        bad_values = {0x8D005FB8, 0xE8000001, 0x448BFFF8}
+        got_immediates = {x["value"] for x in r["user_constants"] if x["kind"] == "immediate"}
+        assert bad_values.isdisjoint(got_immediates), got_immediates
+
+    def test_windows_amd64_core_strings(self):
+        r = analyze_binary(fixture_path("network_windows_amd64.out"))
+        assert r["format"] == "pe"
+        assert r["arch"] == "x86_64"
+        self.assert_contains_strings(
+            r,
+            {
+                "windows",
+                "tcp6",
+                "Got OS info %s\n",
+                "connected to: %s\n",
+                "[2606:4700:3035::ac43:cf7b]:443",
+                "doesthispersonexist.com:80",
+            },
+        )
 
     def test_windows_arm64_core_strings(self):
         r = analyze_binary(fixture_path("network_windows_arm64.out"))

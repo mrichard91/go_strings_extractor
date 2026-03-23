@@ -12,6 +12,7 @@ REQUIRED_FIXTURES = [
     ("darwin", "arm64", "network_darwin_arm64.out"),
     ("linux", "amd64", "network_linux_amd64.out"),
     ("windows", "386", "network_windows_386.out"),
+    ("windows", "amd64", "network_windows_amd64.out"),
     ("windows", "arm64", "network_windows_arm64.out"),
     ("windows", "arm", "network_windows_arm.out"),
 ]

@@ -2,10 +2,35 @@ import struct
 from pathlib import Path
 
 
-def _read_u(blob, off, ptr_size):
+SUPPORTED_GOPCLNTAB_MAGICS = (0xFFFFFFFB, 0xFFFFFFFA, 0xFFFFFFF0, 0xFFFFFFF1)
+
+
+def _read_u(blob, off, ptr_size, byteorder):
     if ptr_size == 8:
-        return struct.unpack_from("<Q", blob, off)[0]
-    return struct.unpack_from("<I", blob, off)[0]
+        return struct.unpack_from(byteorder + "Q", blob, off)[0]
+    return struct.unpack_from(byteorder + "I", blob, off)[0]
+
+
+def _detect_gopclntab_byteorder(blob):
+    if len(blob) < 4:
+        return None, None
+    magic_le = struct.unpack_from("<I", blob, 0)[0]
+    if magic_le in SUPPORTED_GOPCLNTAB_MAGICS:
+        return "<", magic_le
+    magic_be = struct.unpack_from(">I", blob, 0)[0]
+    if magic_be in SUPPORTED_GOPCLNTAB_MAGICS:
+        return ">", magic_be
+    return None, None
+
+
+def _magic_patterns():
+    patterns = []
+    for byteorder in ("<", ">"):
+        for magic in SUPPORTED_GOPCLNTAB_MAGICS:
+            raw = struct.pack(byteorder + "I", magic)
+            if raw not in patterns:
+                patterns.append(raw)
+    return patterns
 
 
 def _read_cstring(blob, off):
@@ -18,38 +43,46 @@ def _read_cstring(blob, off):
 
 
 def parse_gopclntab_blob(blob, base_va):
+    del base_va  # The current parser only needs the raw table contents.
+
     if len(blob) < 64:
         return [], "gopclntab too small"
 
-    magic = struct.unpack_from("<I", blob, 0)[0]
-    if magic not in (0xFFFFFFFB, 0xFFFFFFFA, 0xFFFFFFF0, 0xFFFFFFF1):
-        return [], f"unsupported gopclntab magic: {hex(magic)}"
+    byteorder, magic = _detect_gopclntab_byteorder(blob)
+    if byteorder is None:
+        got = struct.unpack_from("<I", blob, 0)[0]
+        return [], f"unsupported gopclntab magic: {hex(got)}"
 
     ptr_size = blob[7]
     if ptr_size not in (4, 8):
         return [], f"unsupported pointer size in gopclntab: {ptr_size}"
 
     try:
-        nfunc = _read_u(blob, 8, ptr_size)
-        text_start = _read_u(blob, 8 + 2 * ptr_size, ptr_size)
-        funcname_off = _read_u(blob, 8 + 3 * ptr_size, ptr_size)
-        functab_off = _read_u(blob, 8 + 7 * ptr_size, ptr_size)
+        nfunc = _read_u(blob, 8, ptr_size, byteorder)
+        text_start = _read_u(blob, 8 + 2 * ptr_size, ptr_size, byteorder)
+        funcname_off = _read_u(blob, 8 + 3 * ptr_size, ptr_size, byteorder)
+        functab_off = _read_u(blob, 8 + 7 * ptr_size, ptr_size, byteorder)
     except struct.error:
         return [], "truncated gopclntab header"
 
     if nfunc <= 0 or nfunc > 5_000_000:
         return [], f"invalid nfunc in gopclntab: {nfunc}"
 
+    entry_fmt = byteorder + "II"
+    func_fmt = byteorder + "Ii"
+    entry_size = struct.calcsize(entry_fmt)
+    func_size = struct.calcsize(func_fmt)
+
     entries = []
     for i in range(nfunc):
-        off = functab_off + i * 8
-        if off + 8 > len(blob):
+        off = functab_off + i * entry_size
+        if off + entry_size > len(blob):
             break
-        entry_off, func_off = struct.unpack_from("<II", blob, off)
+        entry_off, func_off = struct.unpack_from(entry_fmt, blob, off)
         foff = functab_off + func_off
-        if foff + 8 > len(blob):
+        if foff + func_size > len(blob):
             continue
-        entry_rel, name_rel = struct.unpack_from("<Ii", blob, foff)
+        entry_rel, name_rel = struct.unpack_from(func_fmt, blob, foff)
         name_abs = funcname_off + name_rel
         name = _read_cstring(blob, name_abs)
         if not name:
@@ -60,7 +93,6 @@ def parse_gopclntab_blob(blob, base_va):
     if not entries:
         return [], "no functions parsed from gopclntab"
 
-    # Size is inferred from next function start.
     entries.sort(key=lambda x: x["start"])
     for i in range(len(entries) - 1):
         nxt = entries[i + 1]["start"]
@@ -80,7 +112,7 @@ def recover_go_symbols_from_pclntab(binary, sections):
     blob = Path(binary).read_bytes()
     if sec is None:
         # Fallback scan for pclntab magic when section names are unavailable.
-        for magic in (b"\xf1\xff\xff\xff", b"\xf0\xff\xff\xff", b"\xfb\xff\xff\xff", b"\xfa\xff\xff\xff"):
+        for magic in _magic_patterns():
             off = 0
             while True:
                 idx = blob.find(magic, off)
