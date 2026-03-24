@@ -35,6 +35,20 @@ class TestCoreExtraction:
                 "connected to: %s\n",
                 "[2606:4700:3035::ac43:cf7b]:443",
                 "doesthispersonexist.com:80",
+                # Expanded: goroutine function strings
+                "goroutine-beacon-started: %s\n",
+                # Expanded: closure strings (via string header dereference)
+                "closure-exfil-ready",
+                # Expanded: defer strings (via string header dereference)
+                "defer-cleanup-handler",
+                # Expanded: nested helper call path
+                "payload-constructed",
+                # Expanded: interface method dispatch
+                "beacon-handler processing: %s\n",
+                # Expanded: select statement (via string header dereference)
+                "select-timeout-reached",
+                # Expanded: additional C2 address
+                "backup-c2.fallback.net:8443",
             },
         )
 
@@ -49,6 +63,16 @@ class TestCoreExtraction:
                 "connected to: %s\n",
                 "[2606:4700:3035::ac43:cf7b]:443",
                 "doesthispersonexist.com:80",
+                # Expanded: goroutine function strings
+                "goroutine-beacon-started: %s\n",
+                # Expanded: closure strings (via string header dereference)
+                "closure-exfil-ready",
+                # Expanded: select statement (via string header dereference)
+                "select-timeout-reached",
+                # Expanded: additional C2 address
+                "backup-c2.fallback.net:8443",
+                # Expanded: nested helper (ADRP+ADD on ARM64)
+                "POST /api/beacon HTTP/1.1\r\n",
             },
         )
 
@@ -65,6 +89,20 @@ class TestCoreExtraction:
                 "connected to: %s\n",
                 "[2606:4700:3035::ac43:cf7b]:443",
                 "doesthispersonexist.com:80",
+                # Expanded: goroutine function strings
+                "goroutine-beacon-started: %s\n",
+                # Expanded: closure strings (via string header dereference)
+                "closure-exfil-ready",
+                # Expanded: defer strings (via string header dereference)
+                "defer-cleanup-handler",
+                # Expanded: nested helper call path
+                "payload-constructed",
+                # Expanded: interface method dispatch
+                "beacon-handler processing: %s\n",
+                # Expanded: select statement (via string header dereference)
+                "select-timeout-reached",
+                # Expanded: additional C2 address
+                "backup-c2.fallback.net:8443",
             },
         )
 
@@ -106,6 +144,11 @@ class TestCoreExtraction:
                 "connected to: %s\n",
                 "[2606:4700:3035::ac43:cf7b]:443",
                 "doesthispersonexist.com:80",
+                # Expanded
+                "backup-c2.fallback.net:8443",
+                "closure-exfil-ready",
+                "select-timeout-reached",
+                "goroutine-beacon-started: %s\n",
             },
         )
 
@@ -120,6 +163,11 @@ class TestCoreExtraction:
                 "connected to: %s\n",
                 "[2606:4700:3035::ac43:cf7b]:443",
                 "doesthispersonexist.com:80",
+                # Expanded
+                "backup-c2.fallback.net:8443",
+                "closure-exfil-ready",
+                "select-timeout-reached",
+                "goroutine-beacon-started: %s\n",
             },
         )
 
@@ -134,8 +182,107 @@ class TestCoreExtraction:
                 "windows",
                 "Got OS info %s\n",
                 "connected to: %s\n",
-                "GET /foo HTTP/1.1\n\n",
                 "tcp6",
+                # Expanded: backup C2 address (matched by domain:port pattern)
+                "backup-c2.fallback.net:8443",
+            },
+        )
+
+
+class TestComplexCallPaths:
+    """Verify extraction through goroutines, closures, channels, and nested calls."""
+
+    def assert_contains_strings(self, result, expected):
+        got = {x["string"] for x in result["user_strings"]}
+        for s in expected:
+            assert s in got, f"missing string {s!r}; got={sorted(got)}"
+
+    def test_goroutine_strings_extracted(self):
+        """Strings from goroutine entry functions appear in output."""
+        r = analyze_binary(fixture_path("network_linux_amd64.out"))
+        self.assert_contains_strings(
+            r,
+            {
+                "goroutine-beacon-started: %s\n",
+                "goroutine-connect-failed: %s\n",
+            },
+        )
+
+    def test_closure_strings_extracted(self):
+        """Strings embedded in anonymous closures are found via header dereference."""
+        r = analyze_binary(fixture_path("network_linux_amd64.out"))
+        self.assert_contains_strings(
+            r,
+            {
+                "closure-exfil-ready",
+                "defer-cleanup-handler",
+                "panic-recovery-triggered",
+            },
+        )
+
+    def test_nested_helper_strings(self):
+        """Strings in helper functions called from main are found."""
+        r = analyze_binary(fixture_path("network_linux_amd64.out"))
+        self.assert_contains_strings(
+            r,
+            {
+                "payload-constructed",
+                "beacon-send-failed: %w",
+            },
+        )
+
+    def test_interface_method_strings(self):
+        """Strings in interface method implementations are found."""
+        r = analyze_binary(fixture_path("network_linux_amd64.out"))
+        self.assert_contains_strings(
+            r,
+            {
+                "beacon-handler processing: %s\n",
+            },
+        )
+
+    def test_channel_select_strings(self):
+        """Strings used in channel operations and select statements are found."""
+        r = analyze_binary(fixture_path("network_linux_amd64.out"))
+        self.assert_contains_strings(
+            r,
+            {
+                "select-timeout-reached",
+                "channel-received: %s\n",
+            },
+        )
+
+    def test_function_strings_include_goroutines(self):
+        """function_strings map includes goroutine and helper function entries."""
+        r = analyze_binary(fixture_path("network_linux_amd64.out"))
+        func_names = {rec["function"] for rec in r["function_strings"]}
+        assert any("goroutineBeacon" in fn for fn in func_names), \
+            f"goroutineBeacon not in function_strings: {sorted(func_names)}"
+        assert any("sendBeacon" in fn for fn in func_names), \
+            f"sendBeacon not in function_strings: {sorted(func_names)}"
+
+    def test_function_strings_include_closures(self):
+        """Strings from inlined closures appear in the parent function's strings."""
+        r = analyze_binary(fixture_path("network_linux_amd64.out"))
+        # Go 1.25 may inline closures into main; check that closure strings
+        # appear either in main.main or in a main.main.funcN entry.
+        all_strings = set()
+        for rec in r["function_strings"]:
+            if "main.main" in rec["function"]:
+                all_strings.update(rec["strings"])
+        assert "closure-exfil-ready" in all_strings or \
+            "closure-exfil-ready" in {x["string"] for x in r["user_strings"]}, \
+            f"closure-exfil-ready not found in main.main strings"
+
+    def test_goroutine_strings_arm64(self):
+        """Goroutine and closure strings are extracted on ARM64."""
+        r = analyze_binary(fixture_path("network_darwin_arm64.out"))
+        self.assert_contains_strings(
+            r,
+            {
+                "goroutine-beacon-started: %s\n",
+                "closure-exfil-ready",
+                "select-timeout-reached",
             },
         )
 

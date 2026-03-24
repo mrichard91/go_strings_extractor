@@ -11,8 +11,8 @@ REQUIRED_FIXTURES = [
     ("darwin", "amd64", "network_darwin_amd64.out"),
     ("darwin", "arm64", "network_darwin_arm64.out"),
     ("linux", "amd64", "network_linux_amd64.out"),
-    ("windows", "386", "network_windows_386.out"),
     ("windows", "amd64", "network_windows_amd64.out"),
+    ("windows", "386", "network_windows_386.out"),
     ("windows", "arm64", "network_windows_arm64.out"),
     ("windows", "arm", "network_windows_arm.out"),
 ]
@@ -40,12 +40,21 @@ def _build_fixture(goos, goarch, filename):
     )
 
 
+def _fixture_is_stale(name):
+    """Check if a fixture binary is missing or older than the Go source."""
+    src = FIXTURES_DIR / "network.go"
+    out = FIXTURES_DIR / name
+    if not out.exists():
+        return True
+    return src.stat().st_mtime > out.stat().st_mtime
+
+
 def pytest_configure(config):
     """Auto-build test fixture binaries if Go is available."""
     missing = [
         (goos, goarch, name)
         for goos, goarch, name in REQUIRED_FIXTURES
-        if not (FIXTURES_DIR / name).exists()
+        if _fixture_is_stale(name)
     ]
     if not missing:
         return

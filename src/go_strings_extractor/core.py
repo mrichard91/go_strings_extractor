@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 import hashlib
+import struct
 
 from .detect import parse_file_type, detect_arch
 from .symbols import parse_nm_main_symbols, select_symbols_to_analyze
@@ -693,6 +694,25 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
                         break
                 if not bad:
                     s = cand
+        # Go 1.25+ indirect string header: fmt.Println("str") compiles to
+        # a LEA that loads the address of a StringHeader {Data uintptr;
+        # Len int} in rodata, not the string bytes directly.  Dereference
+        # when the primary read failed or produced a suspiciously short
+        # result (e.g. len_hint=1 from a variadic argument count).
+        if not s or (strlen is not None and strlen <= 2):
+            ptr_size = 4 if arch == "386" else 8
+            hdr_size = ptr_size * 2
+            if off + hdr_size <= len(blob):
+                pfmt = "<I" if ptr_size == 4 else "<Q"
+                data_ptr = struct.unpack_from(pfmt, blob, off)[0]
+                str_len = struct.unpack_from(pfmt, blob, off + ptr_size)[0]
+                if 2 <= str_len <= 4096:
+                    data_off = va_to_off(data_ptr, sections, image_base=image_base)
+                    if data_off >= 0:
+                        s2 = read_fixed_ascii(blob, data_off, str_len)
+                        if s2 and len(s2) >= 2:
+                            strlen = str_len
+                            s = s2
         # Go stores strings contiguously without null terminators; a wrong
         # len_hint often pulls in adjacent runtime strings.  Detect and fix
         # the two most common mis-reads.
@@ -716,6 +736,19 @@ def analyze_binary(binary_path, include_rodata_fallback=False, include_yara=Fals
             elif not any(ch in s for ch in (" ", "/", "%", "\n")):
                 # Long alphanumeric blob with no separators — likely garbage.
                 s = ""
+
+        # 3) domain:port with trailing garbage from adjacent string data.
+        #    len_hint can overshoot by a few bytes when the generic immediate
+        #    search picks up a neighbouring string's length constant.
+        if s and strlen:
+            m_dp2 = re.match(
+                r"^([a-zA-Z0-9._-]+\.[a-z]{2,}:\d+)",
+                s,
+            )
+            if m_dp2 and len(s) > len(m_dp2.group(1)):
+                rest = s[len(m_dp2.group(1)):]
+                if not rest[0:1] in ("/", "?", "#"):
+                    s = m_dp2.group(1)
 
         if s and strlen and s.startswith("[") and "]" not in s:
             cand = read_cstring(blob, off)

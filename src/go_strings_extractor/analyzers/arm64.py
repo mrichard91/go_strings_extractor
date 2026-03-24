@@ -78,24 +78,18 @@ def parse_block_arm64(block_lines):
             continue
 
         m_add = re.match(r"^([0-9a-fA-F]+)\s+add\s+(x\d+),\s+(x\d+),\s+#(0x[0-9a-fA-F]+|\d+)", s_nocomment)
-        if m_add:
-            dst = m_add.group(2)
-            src = m_add.group(3)
-            imm = parse_num_token(m_add.group(4))
-            if imm is None:
-                continue
-            if dst != src:
-                continue
-            if src in adrp_base:
-                target = adrp_base[src] + imm
-            elif src in adr_base:
-                target = adr_base[src] + imm
-            else:
-                continue
+        if not m_add:
+            continue
+        dst = m_add.group(2)
+        src = m_add.group(3)
+        imm = parse_num_token(m_add.group(4))
+        if imm is None:
+            continue
+        if src in adrp_base:
+            target = adrp_base[src] + imm
+        elif src in adr_base:
+            target = adr_base[src] + imm
         else:
-            m_mov_adr = re.match(r"^([0-9a-fA-F]+)\s+add\s+(x\d+),\s+x\d+,\s+#(0x[0-9a-fA-F]+|\d+)", s_nocomment)
-            if not m_mov_adr:
-                continue
             continue
         strlen = None
 

@@ -35,7 +35,10 @@ def parse_block_x86(block_lines):
                 target = int(m.group(4), 16)
             else:
                 disp = int(m.group(2), 16)
-                # x86/x64 lea rip/eip displacement size is 7-ish in our streams.
+                # Sign-extend 32-bit displacement for negative RIP-relative offsets.
+                if disp >= 0x80000000:
+                    disp -= 0x100000000
+                # x86/x64 REX-prefixed lea [rip+disp32] is 7 bytes.
                 target = insn + 7 + disp
             strlen = None
 
